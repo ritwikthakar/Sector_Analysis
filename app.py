@@ -17,6 +17,7 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+import chat
 import indicators as ind
 
 st.set_page_config(page_title="Sector Rotation Screener", layout="wide")
@@ -618,6 +619,10 @@ def main() -> None:
     if not valid:
         st.info("Select at least one ticker with data.")
         st.stop()
+
+    chat.render_chat(
+        lambda: chat.build_context(close, frames, valid, benchmark, names, uni_choice)
+    )
 
     st.caption(
         f"Daily adjusted prices via Yahoo Finance · last bar {close.index[-1].date()} · benchmark {benchmark} "
