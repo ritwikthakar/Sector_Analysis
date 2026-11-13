@@ -24,6 +24,8 @@ SYSTEM_PROMPT = """You are a markets analyst embedded in a sector-rotation scree
 
 You are given the screener's current data: a rotation table (returns, relative strength vs the benchmark, composite rank, RRG-style quadrant, position vs 50d/200d SMA) and a daily price-action scan (Donchian channel position and breakouts, 200d SMA distance, ADX with +DI/-DI, ATR and volatility regime, a regime label and a -4..+4 trend score).
 
+The data may also include a SECTOR DRILL-DOWN table: the top stocks inside one sector ETF, each with an RRG-style quadrant (vs the sector ETF or the benchmark, as stated), the 5/10/20/50/200 SMA state, Donchian, ADX and ATR. Use it for stock-level questions inside that sector.
+
 Rules:
 - Ground every claim in the supplied data and cite the specific numbers. If the data does not answer the question (news, flows, options positioning, fundamentals, earnings), say so rather than guessing.
 - Relative-strength columns are measured against the stated benchmark. Note when the benchmark itself is falling, because relative strength can then mean "falling less".
@@ -48,6 +50,7 @@ def build_context(
     benchmark: str,
     names: dict,
     universe_label: str,
+    extra: str = "",
 ) -> str:
     """Compact text snapshot of the screener state for the model."""
     c = close[valid]
@@ -101,6 +104,8 @@ def build_context(
         "DAILY PRICE-ACTION SCAN (CSV)",
         pa.to_csv() if not pa.empty else "(not enough history)",
     ]
+    if extra:
+        parts += ["", extra]
     return "\n".join(parts)
 
 

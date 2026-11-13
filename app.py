@@ -9,6 +9,8 @@ Run:  streamlit run app.py
 """
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -19,6 +21,7 @@ from plotly.subplots import make_subplots
 
 import chat
 import indicators as ind
+import stocks
 
 st.set_page_config(page_title="Sector Rotation Screener", layout="wide")
 
@@ -307,6 +310,7 @@ def price_figure(
     chand_mult: float,
     show_brk: bool,
     show_chand: bool,
+    extra_smas: tuple = (),
 ) -> go.Figure:
     x = d.iloc[-window:]
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.58, 0.22, 0.20])
@@ -334,6 +338,13 @@ def price_figure(
         go.Scatter(x=x.index, y=x["sma"], mode="lines", line=dict(width=2, color="#f39c12"), name=f"SMA {sma_n}"),
         row=1, col=1,
     )
+    sma_colors = {5: "#1abc9c", 10: "#3498db", 20: "#9b59b6", 50: "#e67e22"}
+    for n in extra_smas:
+        if f"sma_{n}" in x.columns:
+            fig.add_trace(
+                go.Scatter(x=x.index, y=x[f"sma_{n}"], mode="lines", line=dict(width=1, color=sma_colors.get(n, "#7f8c8d")), name=f"SMA {n}"),
+                row=1, col=1,
+            )
     if show_brk:
         up = x[x["brk_up"]]
         dn = x[x["brk_dn"]]
@@ -568,6 +579,208 @@ def render_price_action(frames: dict, valid: list, benchmark: str, names: dict) 
 
 
 # ---------------------------------------------------------------------------
+# Tab 3: sector drill-down (top 10 stocks by market cap)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=86400, show_spinner="Looking up ETF holdings…")
+def fetch_holdings(etf: str) -> dict:
+    """{ticker: {"weight": pct, "name": str}} from Yahoo's ETF top holdings; {} if unavailable."""
+    try:
+        return stocks.parse_holdings(yf.Ticker(etf).funds_data.top_holdings)
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=43200, show_spinner="Fetching market caps…")
+def fetch_market_caps(tickers: tuple) -> dict:
+    """{ticker: market cap in USD} via Yahoo fast_info (tickers it cannot resolve are omitted)."""
+
+    def one(t: str):
+        try:
+            fi = yf.Ticker(t).fast_info
+            for key in ("market_cap", "marketCap"):
+                try:
+                    v = fi[key]
+                except Exception:
+                    v = None
+                if v:
+                    return t, float(v)
+        except Exception:
+            pass
+        return t, None
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return {t: v for t, v in ex.map(one, tickers) if v}
+
+
+def render_drilldown(
+    close: pd.DataFrame,
+    frames: dict,
+    valid: list,
+    benchmark: str,
+    names: dict,
+    rrg_params: tuple,
+    years: int,
+    drop_today: bool,
+) -> None:
+    smooth, ratio_win, mom_win, tail_len, tail_step = rrg_params
+
+    # --- sector overview + picker -------------------------------------------------
+    c = close[valid]
+    s_ratio, s_mom = ind.rrg(c, close[benchmark], smooth, ratio_win, mom_win)
+    quad = {t: ind.quadrant(s_ratio[t].iloc[-1], s_mom[t].iloc[-1]) for t in valid}
+    s_ret = ind.returns_table(c)
+    overview = pd.DataFrame(
+        {
+            "Name": [names.get(t, t) for t in valid],
+            "Quadrant": [quad[t] for t in valid],
+            "RS-Ratio": s_ratio.iloc[-1].round(2),
+            "RS-Mom": s_mom.iloc[-1].round(2),
+            "1M %": s_ret["1M"].round(1),
+            "3M %": s_ret["3M"].round(1),
+        },
+        index=valid,
+    )
+    st.subheader("Pick a sector")
+    show_df(overview)
+    etf = st.selectbox(
+        "Sector / theme to drill into",
+        valid,
+        format_func=lambda t: f"{t} · {names.get(t, t)} · {quad[t]}",
+        key="dd_etf",
+    )
+
+    with st.expander("Analysis settings"):
+        a1, a2, a3, a4 = st.columns(4)
+        donch_n = int(a1.number_input("Donchian length", 5, 200, 20, key="dd_donch"))
+        adx_n = int(a2.number_input("ADX length", 5, 50, 14, key="dd_adx"))
+        atr_n = int(a3.number_input("ATR length", 5, 50, 14, key="dd_atr"))
+        adx_min = float(a4.number_input("ADX trend threshold", 10, 40, 20, key="dd_adxmin"))
+        custom = st.text_input(
+            "Override constituents (comma-separated tickers; leave blank to use the top 10 by market cap)",
+            "",
+            key="dd_custom",
+        )
+
+    # --- constituents ---------------------------------------------------------------
+    live = fetch_holdings(etf)
+    pool = stocks.STATIC_POOLS.get(etf, [])
+    custom_list = stocks.dedupe(t for t in custom.split(",") if t.strip())
+    candidates = custom_list or stocks.dedupe(list(live) + pool)
+    if not candidates:
+        st.info(
+            f"Couldn't get holdings for {etf} from Yahoo and there is no fallback list for it. "
+            "Enter tickers in 'Override constituents' above."
+        )
+        return
+    caps = fetch_market_caps(tuple(sorted(candidates)))
+    top = candidates[:15] if custom_list else stocks.select_top(candidates, caps, 10)
+    meta = {t: live.get(t, {}) for t in top}
+    st.caption(
+        ("Custom list. " if custom_list else f"Ranked by live market cap from {len(live)} Yahoo ETF holdings + {len(pool)} fallback names. ")
+        + f"{len(caps)}/{len(candidates)} market caps resolved."
+        + (" Names without a market cap are listed last." if len(caps) < len(candidates) and not custom_list else "")
+    )
+
+    sframes = load_prices(tuple(sorted(top)), years)
+    if drop_today:
+        sframes = drop_unfinished_bar(sframes)
+    missing = [t for t in top if t not in sframes]
+    if missing:
+        st.warning("No price data for: " + ", ".join(missing))
+    top = [t for t in top if t in sframes]
+    if not top:
+        st.info("No price data available for these stocks.")
+        return
+
+    sclose = pd.DataFrame({t: sframes[t]["Close"] for t in top}).sort_index().ffill()
+    ref_choice = st.radio(
+        "Rotation measured against",
+        [f"Sector ETF ({etf})", f"Benchmark ({benchmark})"],
+        horizontal=True,
+        key="dd_ref",
+    )
+    ref_ticker = etf if ref_choice.startswith("Sector") else benchmark
+    ref_label = ref_choice
+    ref = close[ref_ticker].reindex(sclose.index).ffill()
+    ratio, mom = ind.rrg(sclose, ref, smooth, ratio_win, mom_win)
+
+    table = stocks.stock_table(
+        {t: sframes[t] for t in top}, sclose, ref, ratio, mom, caps, meta,
+        donch_n, adx_n, atr_n, adx_min, 25.0,
+    )
+    if table.empty:
+        st.info("Not enough history to analyse these stocks.")
+        return
+
+    # --- summary --------------------------------------------------------------------
+    st.subheader(f"{etf} · {names.get(etf, etf)}: top {len(table)} stocks")
+    qc = table["Quadrant"].value_counts()
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Leading", int(qc.get("Leading", 0)))
+    k2.metric("Improving", int(qc.get("Improving", 0)))
+    k3.metric("Weakening", int(qc.get("Weakening", 0)))
+    k4.metric("Lagging", int(qc.get("Lagging", 0)))
+    k5.metric("Above 50d", f"{(table['>50'] == '✔').sum()}/{len(table)}")
+    k6.metric("Above 200d", f"{(table['>200'] == '✔').sum()}/{len(table)}")
+
+    cols = [
+        "Name", "Mkt cap $B", "Wt %", "Quadrant", "RS-Ratio", "RS-Mom", "1M %", "3M %", "Rel 3M",
+        "Trend", "MAs above", ">5", ">10", ">20", ">50", ">200", "Stack", "50/200", "vs 50d %", "vs 200d %",
+        "Breakout", "Donchian %", "ADX", "ADX read", "DI bias", "ATR %", "Vol regime", "Score",
+    ]
+    view = table[cols].round(
+        {"Mkt cap $B": 0, "Wt %": 1, "RS-Ratio": 1, "RS-Mom": 1, "1M %": 1, "3M %": 1, "Rel 3M": 1,
+         "vs 50d %": 1, "vs 200d %": 1, "Donchian %": 0, "ADX": 1, "ATR %": 2}
+    )
+    show_df(view)
+    st.download_button("Download CSV", view.to_csv().encode(), f"{etf}_top_stocks.csv", "text/csv")
+    st.caption(
+        f"Quadrant = RRG-style RS-Ratio / RS-Momentum of each stock vs {ref_label} (sorted Leading → Lagging). "
+        "Trend comes from how many of the 5/10/20/50/200 SMAs price is above (5 > 10 > 20 > 50 > 200 = bull stack). "
+        "Score = -4…+4 from close vs 200 SMA, DI direction, Donchian midline and breakout. "
+        "Weights are from the ETF's own holdings, where available."
+    )
+
+    try:  # let the AI analyst in the sidebar see this table
+        st.session_state["chat_extra"] = (
+            f"SECTOR DRILL-DOWN: top stocks in {etf} ({names.get(etf, etf)}); rotation measured vs {ref_ticker}\n"
+            + view.to_csv()
+        )
+    except Exception:
+        pass
+
+    # --- rotation chart ---------------------------------------------------------------
+    left, right = st.columns([1.2, 1])
+    with left:
+        show_fig(rrg_figure(ratio, mom, list(table.index), tail_len, tail_step))
+    with right:
+        q_order = ["Leading", "Improving", "Weakening", "Lagging"]
+        for q in q_order:
+            members = list(table.index[table["Quadrant"] == q])
+            st.markdown(f"**{q}** ({len(members)}): " + (", ".join(members) if members else "none"))
+
+    # --- one stock in detail ------------------------------------------------------------
+    st.subheader("Stock detail")
+    d1, d2 = st.columns([2, 1])
+    sel = d1.selectbox("Stock", list(table.index), key="dd_stock",
+                       format_func=lambda t: f"{t} · {table.loc[t, 'Quadrant']} · {table.loc[t, 'Trend']}")
+    window = int(d2.slider("Chart window (days)", 100, 750, 300, key="dd_window"))
+    d = stocks.with_smas(ind.add_indicators(sframes[sel], donch_n, 200, adx_n, atr_n, 3.0))
+    for line in stocks.describe_stock(d, table.loc[sel], ref_label) + ind.describe_latest(
+        d, donch_n, 200, adx_n, atr_n, adx_min, 25.0, 3.0
+    ):
+        st.markdown("- " + line)
+    o1, o2 = st.columns(2)
+    show_brk = o1.checkbox("Mark Donchian breakouts", value=True, key="dd_brk")
+    show_chand = o2.checkbox("Show ATR chandelier stop", value=False, key="dd_chand")
+    show_fig(
+        price_figure(d, sel, window, donch_n, 200, adx_min, 25.0, 3.0, show_brk, show_chand,
+                     extra_smas=(5, 10, 20, 50))
+    )
+    st.caption("Descriptive analytics on daily adjusted prices, not trading advice.")
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -621,7 +834,9 @@ def main() -> None:
         st.stop()
 
     chat.render_chat(
-        lambda: chat.build_context(close, frames, valid, benchmark, names, uni_choice)
+        lambda: chat.build_context(
+            close, frames, valid, benchmark, names, uni_choice, st.session_state.get("chat_extra", "")
+        )
     )
 
     st.caption(
@@ -629,11 +844,14 @@ def main() -> None:
         f"({names.get(benchmark, benchmark)})"
     )
 
-    tab_rot, tab_pa = st.tabs(["Rotation screener", "Price action (daily)"])
+    rrg_params = (smooth, ratio_win, mom_win, tail_len, tail_step)
+    tab_rot, tab_pa, tab_dd = st.tabs(["Rotation screener", "Price action (daily)", "Sector drill-down"])
     with tab_rot:
-        render_rotation(close, benchmark, valid, names, pairs, (smooth, ratio_win, mom_win, tail_len, tail_step))
+        render_rotation(close, benchmark, valid, names, pairs, rrg_params)
     with tab_pa:
         render_price_action(frames, valid, benchmark, names)
+    with tab_dd:
+        render_drilldown(close, frames, valid, benchmark, names, rrg_params, years, drop_today)
 
 
 main()
