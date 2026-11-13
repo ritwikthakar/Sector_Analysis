@@ -18,7 +18,7 @@ import indicators as ind
 
 MODELS = ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"]
 MAX_HISTORY = 20
-MAX_TOKENS = 1500
+MAX_TOKENS = 4096
 
 SYSTEM_PROMPT = """You are a markets analyst embedded in a sector-rotation screener used by an active options and equity trader.
 
@@ -115,7 +115,8 @@ def _secret_key() -> str:
     return k or os.environ.get("ANTHROPIC_API_KEY", "")
 
 
-def _stream(api_key: str, model: str, context: str, messages: list):
+def _stream(api_key: str, model: str, context: str, messages: list, info: dict):
+    """Yield reply text; fill `info` with stop reason / block types for diagnostics."""
     import anthropic  # imported lazily so the rest of the app works without it
 
     client = anthropic.Anthropic(api_key=api_key)
@@ -126,11 +127,18 @@ def _stream(api_key: str, model: str, context: str, messages: list):
     with client.messages.stream(model=model, max_tokens=MAX_TOKENS, system=system, messages=messages) as s:
         for text in s.text_stream:
             yield text
+        final = s.get_final_message()
+        info["stop_reason"] = final.stop_reason
+        info["blocks"] = [b.type for b in final.content]
+        info["output_tokens"] = getattr(final.usage, "output_tokens", None)
 
 
 def _api_messages(history: list) -> list:
-    """Last MAX_HISTORY turns, starting on a user message (the API requires that)."""
-    msgs = history[-MAX_HISTORY:]
+    """Last MAX_HISTORY turns, starting on a user message (the API requires that).
+
+    Empty messages (e.g. from a reply that came back blank) are dropped, since the API rejects them.
+    """
+    msgs = [m for m in history if str(m.get("content", "")).strip()][-MAX_HISTORY:]
     while msgs and msgs[0]["role"] != "user":
         msgs = msgs[1:]
     return msgs
@@ -165,6 +173,8 @@ def render_chat(context_fn) -> None:
             if not history:
                 st.caption("Ask about the data currently loaded: rotation, breakouts, ADX/ATR, long/short candidates.")
             for m in history:
+                if not str(m["content"]).strip():
+                    continue
                 with st.chat_message(m["role"]):
                     st.markdown(m["content"])
 
@@ -185,8 +195,17 @@ def render_chat(context_fn) -> None:
                 st.markdown(prompt)
             with st.chat_message("assistant"):
                 try:
-                    reply = st.write_stream(_stream(key, model, context_fn(), _api_messages(history)))
-                    history.append({"role": "assistant", "content": reply})
+                    info: dict = {}
+                    reply = st.write_stream(_stream(key, model, context_fn(), _api_messages(history), info))
+                    if isinstance(reply, str) and reply.strip():
+                        history.append({"role": "assistant", "content": reply})
+                    else:
+                        history.pop()
+                        st.warning(
+                            "The model returned no text "
+                            f"(stop reason: {info.get('stop_reason')}, blocks: {info.get('blocks')}, "
+                            f"output tokens: {info.get('output_tokens')}). Try again or pick another model."
+                        )
                 except ImportError:
                     history.pop()
                     st.error("The `anthropic` package is missing. Run: pip install anthropic")
