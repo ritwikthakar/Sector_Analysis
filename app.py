@@ -766,7 +766,13 @@ def render_drilldown(
         "Trend", "MAs above", ">5", ">10", ">20", ">50", ">200", "Stack", "50/200", "vs 50d %", "vs 200d %",
         "Cloud", "Ichimoku", "Breakout", "Donchian %", "ADX", "ADX read", "DI bias", "ATR %", "Vol regime", "Score",
     ]
-    view = table[cols].round(
+    absent = [c for c in cols if c not in table.columns]
+    if absent:
+        st.warning(
+            "These columns are missing from the stock analysis: " + ", ".join(absent)
+            + ". This usually means stocks.py is an older version than app.py; update it and reboot the app."
+        )
+    view = table[[c for c in cols if c in table.columns]].round(
         {"Mkt cap $B": 0, "Wt %": 1, "RS-Ratio": 1, "RS-Mom": 1, "1M %": 1, "3M %": 1, "Rel 3M": 1,
          "vs 50d %": 1, "vs 200d %": 1, "Donchian %": 0, "ADX": 1, "ATR %": 2}
     )
