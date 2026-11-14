@@ -9,6 +9,7 @@ import re
 import numpy as np
 import pandas as pd
 
+import ichimoku
 import indicators as ind
 
 MA_LENGTHS = (5, 10, 20, 50, 200)
@@ -147,12 +148,15 @@ def stock_snapshot(
         cross = "50 > 200" if smas[50] > smas[200] else "50 < 200"
         count_txt = f"{count}/5"
     tick = {True: "✔", False: "✘"}
+    ich = ichimoku.read(df)
     row = {
         "Trend": trend,
         "MAs above": count_txt,
         **{f">{n}": tick[flags[n]] if pd.notna(smas[n]) else "–" for n in MA_LENGTHS},
         "Stack": stack,
         "50/200": cross,
+        "Cloud": ich["pos"].capitalize() if ich else "n/a",
+        "Ichimoku": ich["label"] if ich else "n/a",
         "vs 50d %": (c / smas[50] - 1) * 100 if pd.notna(smas[50]) else np.nan,
         "vs 200d %": (c / smas[200] - 1) * 100 if pd.notna(smas[200]) else np.nan,
         "Donchian %": snap["Donchian %"],

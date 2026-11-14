@@ -20,6 +20,7 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 import chat
+import ichimoku
 import indicators as ind
 import stocks
 
@@ -311,6 +312,8 @@ def price_figure(
     show_brk: bool,
     show_chand: bool,
     extra_smas: tuple = (),
+    show_dc_sma: bool = True,
+    show_ichimoku: bool = False,
 ) -> go.Figure:
     x = d.iloc[-window:]
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.58, 0.22, 0.20])
@@ -319,32 +322,67 @@ def price_figure(
         go.Candlestick(x=x.index, open=x["Open"], high=x["High"], low=x["Low"], close=x["Close"], name=ticker, showlegend=False),
         row=1, col=1,
     )
-    fig.add_trace(
-        go.Scatter(x=x.index, y=x["dc_upper"], mode="lines", line=dict(width=1, color="#7f8c8d"), name=f"Donchian {donch_n} upper"),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=x.index, y=x["dc_lower"], mode="lines", line=dict(width=1, color="#7f8c8d"),
-            fill="tonexty", fillcolor="rgba(127,140,141,0.10)", name=f"Donchian {donch_n} lower",
-        ),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=x.index, y=x["dc_mid"], mode="lines", line=dict(width=1, dash="dot", color="#95a5a6"), name="Donchian mid"),
-        row=1, col=1,
-    )
-    fig.add_trace(
-        go.Scatter(x=x.index, y=x["sma"], mode="lines", line=dict(width=2, color="#f39c12"), name=f"SMA {sma_n}"),
-        row=1, col=1,
-    )
-    sma_colors = {5: "#1abc9c", 10: "#3498db", 20: "#9b59b6", 50: "#e67e22"}
-    for n in extra_smas:
-        if f"sma_{n}" in x.columns:
+    if show_dc_sma:
+        fig.add_trace(
+            go.Scatter(x=x.index, y=x["dc_upper"], mode="lines", line=dict(width=1, color="#7f8c8d"), name=f"Donchian {donch_n} upper"),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x.index, y=x["dc_lower"], mode="lines", line=dict(width=1, color="#7f8c8d"),
+                fill="tonexty", fillcolor="rgba(127,140,141,0.10)", name=f"Donchian {donch_n} lower",
+            ),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=x.index, y=x["dc_mid"], mode="lines", line=dict(width=1, dash="dot", color="#95a5a6"), name="Donchian mid"),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=x.index, y=x["sma"], mode="lines", line=dict(width=2, color="#f39c12"), name=f"SMA {sma_n}"),
+            row=1, col=1,
+        )
+        sma_colors = {5: "#1abc9c", 10: "#3498db", 20: "#9b59b6", 50: "#e67e22"}
+        for n in extra_smas:
+            if f"sma_{n}" in x.columns:
+                fig.add_trace(
+                    go.Scatter(x=x.index, y=x[f"sma_{n}"], mode="lines", line=dict(width=1, color=sma_colors.get(n, "#7f8c8d")), name=f"SMA {n}"),
+                    row=1, col=1,
+                )
+    if show_ichimoku:
+        ich = ichimoku.compute(d)
+        w = ich[ich.index >= x.index[0]]
+        sa, sb = w["span_a"], w["span_b"]
+        top, bot = np.maximum(sa, sb), np.minimum(sa, sb)
+        bull = sa >= sb
+        valid_cloud = sa.notna() & sb.notna()
+        for is_bull, fill, edge, nm in (
+            (True, "rgba(46,204,113,0.20)", "rgba(46,204,113,0.55)", "Cloud (Span A > B)"),
+            (False, "rgba(231,76,60,0.20)", "rgba(231,76,60,0.55)", "Cloud (Span A < B)"),
+        ):
+            m = bull if is_bull else ~bull
+            m = (m | m.shift(1, fill_value=False) | m.shift(-1, fill_value=False)) & valid_cloud  # overlap one bar so colours join
             fig.add_trace(
-                go.Scatter(x=x.index, y=x[f"sma_{n}"], mode="lines", line=dict(width=1, color=sma_colors.get(n, "#7f8c8d")), name=f"SMA {n}"),
+                go.Scatter(x=w.index, y=bot.where(m), mode="lines", line=dict(width=0), hoverinfo="skip", showlegend=False),
                 row=1, col=1,
             )
+            fig.add_trace(
+                go.Scatter(x=w.index, y=top.where(m), mode="lines", line=dict(width=0.5, color=edge),
+                           fill="tonexty", fillcolor=fill, hoverinfo="skip", name=nm),
+                row=1, col=1,
+            )
+        fig.add_trace(
+            go.Scatter(x=w.index, y=w["tenkan"], mode="lines", line=dict(width=1.5, color="#2563eb"), name="Tenkan (9)"),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=w.index, y=w["kijun"], mode="lines", line=dict(width=1.5, color="#dc2626"), name="Kijun (26)"),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=w.index, y=w["chikou"], mode="lines", line=dict(width=1, dash="dot", color="#16a34a"), name="Chikou"),
+            row=1, col=1,
+        )
     if show_brk:
         up = x[x["brk_up"]]
         dn = x[x["brk_dn"]]
@@ -726,7 +764,7 @@ def render_drilldown(
     cols = [
         "Name", "Mkt cap $B", "Wt %", "Quadrant", "RS-Ratio", "RS-Mom", "1M %", "3M %", "Rel 3M",
         "Trend", "MAs above", ">5", ">10", ">20", ">50", ">200", "Stack", "50/200", "vs 50d %", "vs 200d %",
-        "Breakout", "Donchian %", "ADX", "ADX read", "DI bias", "ATR %", "Vol regime", "Score",
+        "Cloud", "Ichimoku", "Breakout", "Donchian %", "ADX", "ADX read", "DI bias", "ATR %", "Vol regime", "Score",
     ]
     view = table[cols].round(
         {"Mkt cap $B": 0, "Wt %": 1, "RS-Ratio": 1, "RS-Mom": 1, "1M %": 1, "3M %": 1, "Rel 3M": 1,
@@ -738,6 +776,7 @@ def render_drilldown(
         f"Quadrant = RRG-style RS-Ratio / RS-Momentum of each stock vs {ref_label} (sorted Leading → Lagging). "
         "Trend comes from how many of the 5/10/20/50/200 SMAs price is above (5 > 10 > 20 > 50 > 200 = bull stack). "
         "Score = -4…+4 from close vs 200 SMA, DI direction, Donchian midline and breakout. "
+        "Cloud / Ichimoku = price vs the Ichimoku cloud and an overall signal (classic 9/26/52). "
         "Weights are from the ETF's own holdings, where available."
     )
 
@@ -770,12 +809,20 @@ def render_drilldown(
         d, donch_n, 200, adx_n, atr_n, adx_min, 25.0, 3.0
     ):
         st.markdown("- " + line)
-    o1, o2 = st.columns(2)
-    show_brk = o1.checkbox("Mark Donchian breakouts", value=True, key="dd_brk")
-    show_chand = o2.checkbox("Show ATR chandelier stop", value=False, key="dd_chand")
+    st.markdown("**Ichimoku analysis** (classic 9 / 26 / 52 settings)")
+    for line in ichimoku.describe(ichimoku.read(sframes[sel])):
+        st.markdown("- " + line)
+
+    o1, o2, o3, o4 = st.columns(4)
+    show_dc_sma = o1.checkbox("DC + SMA", value=True, key="dd_dcsma",
+                              help="Donchian channel plus the 5/10/20/50/200 SMAs")
+    show_ich = o2.checkbox("Ichimoku cloud", value=False, key="dd_ich",
+                           help="Cloud, Tenkan, Kijun and Chikou (cloud projected 26 bars ahead)")
+    show_brk = o3.checkbox("Mark Donchian breakouts", value=True, key="dd_brk")
+    show_chand = o4.checkbox("Show ATR chandelier stop", value=False, key="dd_chand")
     show_fig(
         price_figure(d, sel, window, donch_n, 200, adx_min, 25.0, 3.0, show_brk, show_chand,
-                     extra_smas=(5, 10, 20, 50))
+                     extra_smas=(5, 10, 20, 50), show_dc_sma=show_dc_sma, show_ichimoku=show_ich)
     )
     st.caption("Descriptive analytics on daily adjusted prices, not trading advice.")
 
